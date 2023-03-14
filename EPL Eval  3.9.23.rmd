@@ -1,0 +1,530 @@
+---
+title: "EPL Match Prediction"
+author: "Forrest Allen"
+date: "2023-01-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries}
+library(worldfootballR) #import data
+library(dplyr)#data transformation
+library(stringr) #edit text
+library(lubridate) #deal with dates
+library(readr) #write csv functions
+library(zoo) #rolling totals
+library(xgboost) #xgboost modeling
+library(caret) #confusion matrices
+library(SHAPforxgboost)#shap analysis
+library(skimr) #data inspection
+
+```
+
+
+```{r Acquire Most Recent Match Data}
+
+team_urls18<-fb_teams_urls("https://fbref.com/en/comps/9/2017-2018/2017-2018-Premier-League-Stats",time_pause = 1)
+team_urls19<-fb_teams_urls("https://fbref.com/en/comps/9/2018-2019/2018-2019-Premier-League-Stats",time_pause = 1)
+team_urls20<-fb_teams_urls("https://fbref.com/en/comps/9/2019-2020/2019-2020-Premier-League-Stats",time_pause = 1)
+team_urls21<-fb_teams_urls("https://fbref.com/en/comps/9/2020-2021/2020-2021-Premier-League-Stats",time_pause = 1)
+team_urls22<-fb_teams_urls("https://fbref.com/en/comps/9/2021-2022/2021-2022-Premier-League-Stats",time_pause = 1)
+team_urls23<-fb_teams_urls("https://fbref.com/en/comps/9/Premier-League-Stats")
+
+team_urls<-c(team_urls18, team_urls19, team_urls20, team_urls21, team_urls22, team_urls23)
+
+summ_match_stats<-data.frame()
+
+for (season in team_urls) {
+        sum_stats<-fb_team_match_log_stats(team_urls = season, stat_type = "shooting")
+        sum_loop<-data.frame(sum_stats)
+        summ_match_stats<-rbind(summ_match_stats, sum_loop)
+        
+}
+
+
+keep_match_stats<-data.frame()
+for (season in team_urls) {
+        keep_stats<-fb_team_match_log_stats(team_urls = season, stat_type = "keeper")
+        keep_loop<-data.frame(keep_stats)
+        keep_match_stats<-rbind(keep_match_stats, keep_loop)
+        
+}
+
+pass_match_stats<-data.frame()
+for (season in team_urls) {
+        pass_stats<-fb_team_match_log_stats(team_urls = season, stat_type = "passing")
+        pass_loop<-data.frame(pass_stats)
+        pass_match_stats<-rbind(pass_match_stats, pass_loop)
+        
+}
+
+ptypes_match_stats<-data.frame()
+for (season in team_urls) {
+        ptypes_stats<-fb_team_match_log_stats(team_urls = season, stat_type = "passing_types")
+        ptypes_loop<-data.frame(ptypes_stats)
+        ptypes_match_stats<-rbind(ptypes_match_stats, ptypes_loop)
+        
+}
+
+gca_match_stats<-data.frame()
+for (season in team_urls) {
+        gca_stats<-fb_team_match_log_stats(team_urls = season, stat_type = "gca")
+        gca_loop<-data.frame(gca_stats)
+        gca_match_stats<-rbind(gca_match_stats,gca_loop)
+        
+}
+
+defense_match_stats<-data.frame()
+for (season in team_urls) {
+        defense_stats<-fb_team_match_log_stats(team_urls = season, stat_type = "defense")
+        defense_loop<-data.frame(defense_stats)
+        defense_match_stats<-rbind(defense_match_stats, defense_loop)
+        
+}
+
+misc_match_stats<-data.frame()
+for (season in team_urls) {
+        misc_stats<-fb_team_match_log_stats(team_urls = season, stat_type = "misc")
+        misc_loop<-data.frame(misc_stats)
+        misc_match_stats<-rbind(misc_match_stats, misc_loop)
+        
+}
+        
+write_csv(summ_match_stats,"Match_Log_stats_shoot_MW_25.csv")
+write_csv(keep_match_stats,"Match_Log_stas_keep_MW_25.csv")
+write_csv(pass_match_stats,"Match_Log_stats_pass_MW_25.csv")
+write_csv(ptypes_match_stats,"Match_Log_stats_ptype_MW_25.csv")
+write_csv(gca_match_stats,"Match_Log_stats_gca_MW_25.csv")
+write_csv(defense_match_stats,"Match_Log_stats_defense_MW_25.csv")
+write_csv(misc_match_stats,"Match_Log_stats_misc_MW_25.csv")
+```
+
+```{r Import Data}
+#data collected through Data Acquistion for EPL file
+shoot <- read_csv("Match_Log_stats_shoot_MW_25.csv", show_col_types = FALSE)
+keeper <- read_csv("Match_Log_stas_keep_MW_25.csv", show_col_types = FALSE)
+misc <- read_csv("Match_Log_stats_misc_MW_25.csv", show_col_types = FALSE)
+gca <- read_csv("Match_Log_stats_gca_MW_25.csv", show_col_types = FALSE)
+defense <- read_csv("Match_Log_stats_defense_MW_25.csv", show_col_types = FALSE)
+pass_type <- read_csv("Match_Log_stats_ptype_MW_25.csv", show_col_types = FALSE)
+pass <- read_csv("Match_Log_stats_pass_MW_25.csv", show_col_types = FALSE)
+```
+
+```{r Bring all Stat types Together}
+#create list of dfs
+df_list<-list(shoot, keeper, misc, defense, pass, pass_type, gca)
+
+#sort all data frames to enable combining columns
+all_teams_sorted<-lapply(df_list, function(x) x[with(x, order(Team, Date, Round)),])
+
+#cobmine columns
+all_games<-cbind(all_teams_sorted[[1]],all_teams_sorted[[2]], all_teams_sorted[[3]], all_teams_sorted[[4]],all_teams_sorted[[5]], all_teams_sorted[[6]], all_teams_sorted[[7]])    
+```
+
+```{r}
+match_urls<-load_match_results("ENG", "M", c(2018:2023), "1st")
+match_urls$cat<-ifelse(match_urls$Date > ymd("2022-08-01")  & match_urls$Date < ymd("2023-08-01"),"Predict",
+                           ifelse(match_urls$Date > ymd("2021-08-01")  & match_urls$Date < ymd("2022-08-01"),"Test","Train"))
+
+match_urls$Home<-with(match_urls, ifelse(Home== "Brighton", "Brighton and Hove Albion", 
+                                         ifelse(Home == "Huddersfield","Huddersfield Town",
+                                         ifelse(Home =="Manchester Utd", "Manchester United",
+                                         ifelse(Home=="Newcastle Utd", "Newcastle United",
+                                         ifelse(Home=="Sheffield Utd", "Sheffield United",
+                                         ifelse(Home=="Tottenham", "Tottenham Hotspur",
+                                         ifelse(Home=="West Brom", "West Bromwich Albion",
+                                         ifelse(Home=="West Ham", "West Ham United", 
+                                         ifelse(Home=="Wolves", "Wolverhampton Wanderers",
+                                         ifelse(Home=="Nott'ham Forest", "Nottingham Forest",Home)))))))))))
+
+match_urls$Away<-with(match_urls, ifelse(Away== "Brighton", "Brighton and Hove Albion", 
+                                         ifelse(Away == "Huddersfield","Huddersfield Town",
+                                         ifelse(Away =="Manchester Utd", "Manchester United",
+                                         ifelse(Away=="Newcastle Utd", "Newcastle United",
+                                         ifelse(Away=="Sheffield Utd", "Sheffield United",
+                                         ifelse(Away=="Tottenham", "Tottenham Hotspur",
+                                         ifelse(Away=="West Brom", "West Bromwich Albion",
+                                         ifelse(Away=="West Ham", "West Ham United", 
+                                         ifelse(Away=="Wolves", "Wolverhampton Wanderers",
+                                         ifelse(Away=="Nott'ham Forest", "Nottingham Forest",Away))))))))))) 
+
+match_urls$ID<-paste(match_urls$Home, ymd(match_urls$Date), sep = "_")
+match_urls$Opp_ID<-paste(match_urls$Away, ymd(match_urls$Date), sep = "_")
+```
+
+
+```{r}
+#create win, lose, or draw outcome variable for each match
+
+all_games$Result<-as.factor(all_games$Result)
+
+all_games$Points<-ifelse(all_games$Result=="W",3, 
+                           ifelse(all_games$Result=="L",0,
+                                  ifelse(all_games$Result =="D",1, "FIX")))
+
+#convert to date
+all_games$Date<-ymd(all_games$Date)
+#assign single year since seasons cross two years. Assign start year
+all_games$Year<-ifelse(all_games$Date > ymd("2017-08-01")  & all_games$Date < ymd("2018-08-01"),2017,
+                           ifelse(all_games$Date > ymd("2018-08-01")  & all_games$Date < ymd("2019-08-01"),2018,
+                                  ifelse(all_games$Date > ymd("2019-08-01")  & all_games$Date < ymd("2020-08-01"),2019,
+                                         ifelse(all_games$Date > ymd("2020-08-01") & all_games$Date < ymd("2021-08-01"),2020,
+                                                ifelse(all_games$Date > ymd("2021-08-01") & all_games$Date < ymd("2022-08-01"),2021,
+                                                       ifelse(all_games$Date > ymd("2022-08-01") & all_games$Date < ymd("2023-08-01"),2022,2023))))))
+
+all_games$GameNum<-as.numeric(str_sub(all_games$Round, -2))
+
+#keep only PL games
+pl_games<-all_games[all_games$Comp =="Premier League", ]
+
+```
+
+```{r Choose Variables for Inclusion}
+all_cols<-colnames(pl_games)
+
+include_cols<-c("Team","Date","ForAgainst", "Round","Venue","Result", "GF","GA","Opponent","SoT_Standard","Dist_Standard", "npxG_Expected",      "G_minus_xG_Expected","np.G_minus_xG_Expected","SoTA_Performance","CS_Performance","PSxG_Performance","PSxGPlus_Minus_Performance","Opp_Crosses","Fls_Performance","Fld_Performance", "Int_Performance","TklW_Performance","Lost_Challenges","Sh_Blocks", "Pass_Blocks","Int","Clr","Err","PrgDist_Total","xA", "KP",  "SCA_SCA_Types","GCA_GCA_Types","Points","Year","GameNum")
+
+exclude_cols<-all_cols[!(all_cols %in% include_cols)]
+
+pl_games<-subset(pl_games, select = include_cols)
+```
+
+```{r Create IDs}
+#create team ID to allow their stats and their opponents stats to be totaled
+pl_games$ID<-paste(pl_games$Team,ymd(pl_games$Date),sep = "_")
+
+pl_games$Opponent<-with(pl_games, ifelse(Opponent== "Brighton", "Brighton and Hove Albion", 
+                                         ifelse(Opponent == "Huddersfield","Huddersfield Town",
+                                         ifelse(Opponent =="Manchester Utd", "Manchester United",
+                                         ifelse(Opponent=="Newcastle Utd", "Newcastle United",
+                                         ifelse(Opponent=="Sheffield Utd", "Sheffield United",
+                                         ifelse(Opponent=="Tottenham", "Tottenham Hotspur",
+                                         ifelse(Opponent=="West Brom", "West Bromwich Albion",
+                                         ifelse(Opponent=="West Ham", "West Ham United", 
+                                         ifelse(Opponent=="Wolves", "Wolverhampton Wanderers",
+                                         ifelse(Opponent=="Nott'ham Forest", "Nottingham Forest",Opponent)))))))))))
+
+#create opponent ID to total their stats and their opponents stats
+pl_games$Opp_ID<-paste(pl_games$Opponent,ymd(pl_games$Date),sep = "_")
+
+```
+
+
+```{r Seperate and re-combine Team and Opponents Stats }
+pl_games_tm<-pl_games[pl_games$ForAgainst =="For", ]
+
+pl_games_tm<- pl_games_tm%>%
+  left_join(match_urls, by="ID")
+
+#drop trailing .x and duplicate columns
+pl_games_tm <- pl_games_tm %>% 
+  rename_at(
+    vars(ends_with(".x")),
+    ~str_replace(., "\\..$","")
+  ) %>% 
+  select_at(
+    vars(-ends_with(".y"))
+  )
+
+pl_games_tm<- pl_games_tm%>%
+  left_join(match_urls, by=c("ID" = "Opp_ID"))
+
+names(pl_games_tm)[names(pl_games_tm) == 'MatchURL.y'] <- 'MatchURL_opp'
+
+#drop trailing .x and duplicate columns
+pl_games_tm <- pl_games_tm %>% 
+  rename_at(
+    vars(ends_with(".x")),
+    ~str_replace(., "\\..$","")
+  ) %>% 
+  select_at(
+    vars(-ends_with(".y"))
+ )
+
+pl_games_tm$URL_ID<-ifelse(is.na(pl_games_tm$MatchURL),pl_games_tm$MatchURL_opp,pl_games_tm$MatchURL)
+
+pl_games_tm<-subset(pl_games_tm, select = -c(Competition_Name,Gender,Country,Season_End_Year,Wk,Day,Time, Home,HomeGoals,Home_xG,Away,AwayGoals, Away_xG,Attendance,Referee,Notes,cat, MatchURL, MatchURL_opp))
+
+```
+
+
+```{r Import Historical Odds}
+odds<- read_csv("EPL Training Odds 17-21.csv", show_col_types = FALSE)
+
+names(odds)[names(odds) == 'TmoddsID'] <- 'ID'
+
+pl_games_odds<-pl_games_tm %>%
+        left_join(odds, by = 'ID' )
+
+opp_odds<- read_csv("EPL Training Odds 17-21.csv", show_col_types = FALSE)
+
+opp_odds <- opp_odds %>% 
+        rename("Opp_ID" = "TmoddsID",
+               "Opp_win_Odds" = "Tm_win_odds",
+               "Draw_odds_opp" = "Draw_odds")
+
+#join team and their opponents stats
+pl_games_odds<-pl_games_odds%>%
+        left_join(opp_odds, by ='Opp_ID')
+
+```
+
+```{r Change Data Types}
+
+pl_games_odds<-pl_games_odds %>%
+        mutate_at(c("GF", "GA","GF","Tm_win_odds", "Draw_odds", "Opp_win_Odds", "Points"), as.numeric)
+
+pl_games_odds<-pl_games_odds[!duplicated(pl_games_odds$ID), ]
+
+#lack of attempts for stats result in NA values due to division by 0
+#change NA to 0
+
+pl_games_odds[is.na(pl_games_odds)] <- 0
+
+```
+
+```{r Season to Date Totals}
+
+options(dplyr.summarise.inform = FALSE)
+
+#subtract that games total so only evaluating previous games
+small_games_STD<-pl_games_odds %>%
+        group_by(Team, Year)%>%
+        summarise(Goals_Scored=cumsum(GF) - GF,
+                  Goals_Allowed=cumsum(GA) -GA,
+                  Date = Date,
+                  ShotsonTgt=cumsum(SoT_Standard) - SoT_Standard,
+                  ShotDistAvg=cummean(Dist_Standard),
+                  NonPen_XGoals=cumsum(npxG_Expected) ,
+                  NonPen_GoalsMinusXGoals=cumsum(np.G_minus_xG_Expected) -np.G_minus_xG_Expected,
+                  ShotonTgtFaced=cumsum(SoTA_Performance) - SoTA_Performance,
+                  CleanSheets=cumsum(CS_Performance) - CS_Performance,
+                  PostShotXGoals=cumsum(PSxG_Performance) - PSxG_Performance,
+                  PostShotXGoalsMinusGoalsAllowed=cumsum(PSxGPlus_Minus_Performance) - PSxG_Performance,
+                  FoulsCommitted=cumsum(Fls_Performance) - Fls_Performance,
+                  FoulsDrawn=cumsum(Fld_Performance) - Fld_Performance,
+                  Interceptions=cumsum(Int_Performance) - Int_Performance,
+                  TacklesWon=cumsum(TklW_Performance) - TklW_Performance,
+                  ChallengesLost=cumsum(Lost_Challenges) - Lost_Challenges,
+                  BlockedShots=cumsum(Sh_Blocks) - Sh_Blocks,
+                  BlockedPasses=cumsum(Pass_Blocks) - Pass_Blocks,
+                  Clearances=cumsum(Clr) - Clr,
+                  Errors=cumsum(Err) - Err,
+                  ProgressivePassingDist=cumsum(PrgDist_Total) - PrgDist_Total,
+                  XAssists=cumsum(xA) - xA,
+                  KeyPasses=cumsum(KP) - KP,
+                  ShotCreatingActions=cumsum(SCA_SCA_Types) - SCA_SCA_Types,
+                  GoalCreatingActions=cumsum(GCA_GCA_Types) - GCA_GCA_Types,
+                  TmWinProbability=Tm_win_odds,
+                  DrawProability=Draw_odds,
+                  Result=Result,
+                  Points=cumsum(Points) - Points,
+                  ID=ID,
+                  GameNum=GameNum,
+                  Opp_ID=Opp_ID,
+                  URL_ID= URL_ID)
+
+#create Pythag poings
+small_games_STD$Pythag<-(0.677*(small_games_STD$Goals_Scored - small_games_STD$Goals_Allowed) + 52.39) * (small_games_STD$GameNum / 38)
+
+#remove duplicates
+small_games_STD<-small_games_STD[!duplicated(small_games_STD$ID), ]
+```
+
+
+```{r Create last k games totals}
+#select increment for recency number
+#accuracy numbers at different values of k
+#k=3 .52, k=4 .535, k=5 .561, k=6 .5531
+
+k<-5
+
+#subtract stats from game from rolling totals
+small_game_rolling<- pl_games_odds%>%
+  group_by(Team, Year)%>%
+  summarise(GoalsScored_rec = rollapply (GF, width = k, FUN = sum, partial = TRUE, align = "right") - GF,
+         GoalsAllowed_rec = rollapply (GA, width = k, FUN = sum, partial = TRUE, align = "right") - GA,
+         ShotsonTgt_rec = rollapply(SoT_Standard, width = k, FUN = sum, partial = TRUE, align = "right") - SoT_Standard,
+         AvgDistShot_rec = rollapply(Dist_Standard, width = k, FUN = mean, partial = TRUE, align = "right"),
+         NonPen_XGoals_rec= rollapply(npxG_Expected, width = k, FUN = sum, partial = TRUE, align = "right") - npxG_Expected,
+         NonPen_XGoalsMinusXGoals_rec = rollapply(np.G_minus_xG_Expected, width = k, FUN = sum, partial = TRUE, align = "right") - np.G_minus_xG_Expected ,
+         ShotonTgtFaced_rec = rollapply(SoTA_Performance, width = k, FUN = sum, partial = TRUE, align = "right") - SoTA_Performance,
+         CleanSheets_rec = rollapply(CS_Performance, width = k, FUN = sum, partial = TRUE, align = "right") -CS_Performance,
+         PostShotXGoals_rec = rollapply(PSxG_Performance, width = k, FUN = sum, partial = TRUE, align = "right") - PSxG_Performance,
+         PostShotXGoalsMinusGoalsAllowed_rec = rollapply(PSxGPlus_Minus_Performance, width = k, FUN = sum, partial = TRUE, align = "right") - PSxGPlus_Minus_Performance,
+         FoulsCommitted_rec = rollapply(Fls_Performance, width = k, FUN = sum, partial = TRUE, align = "right") - Fls_Performance,
+         FoulsDrawn_rec = rollapply(Fld_Performance, width = k, FUN = sum, partial = TRUE, align = "right") - Fld_Performance,
+         Interceptions_rec = rollapply(Int_Performance, width = k, FUN = sum, partial = TRUE, align = "right") -Int_Performance,
+         ChallengesLost_rec = rollapply(Lost_Challenges, width = k, FUN = sum, partial = TRUE, align = "right") - Lost_Challenges,
+         BlockedShots_rec = rollapply(Sh_Blocks, width = k, FUN = sum, partial = TRUE, align = "right") - Sh_Blocks,
+         BlockedPasses_rec = rollapply(Pass_Blocks, width = k, FUN = sum, partial = TRUE, align = "right") - Pass_Blocks,
+         Clearances_rec = rollapply(Clr, width = k, FUN = sum, partial = TRUE, align = "right") - Clr,
+         Errors_rec = rollapply(Err, width = k, FUN = sum, partial = TRUE, align = "right") - Err,
+         ProgressivePassingDist_rec = rollapply(PrgDist_Total, width = k, FUN = sum, partial = TRUE, align = "right") - PrgDist_Total,
+         XAssists_rec = rollapply(xA, width = k, FUN = sum, partial = TRUE, align = "right") - xA,
+         KeyPasses_rec = rollapply(KP, width = k, FUN = sum, partial = TRUE, align = "right") - KP,
+         ShotCreatingActions_rec = rollapply(SCA_SCA_Types, width = k, FUN = sum, partial = TRUE, align = "right") - SCA_SCA_Types,
+         GoalCreatingActions_rec = rollapply(GCA_GCA_Types, width = k, FUN = sum, partial = TRUE, align = "right") - GCA_GCA_Types,
+         Points_rec = rollapply(Points, width = k, FUN = sum, partial = TRUE, align = "right") - Points,
+         GameNum=GameNum,
+         URL_ID= URL_ID)   
+
+#create last k Pythag points; if game number is less than k, use as many gaames as we have 
+small_game_rolling$Pythag_rec<-ifelse(small_game_rolling$GameNum<k-1, (0.677*(small_game_rolling$GoalsScored_rec - small_game_rolling$GoalsAllowed_rec) + 52.39) * (small_game_rolling$GameNum / 38), (0.677*(small_game_rolling$GoalsScored_rec - small_game_rolling$GoalsAllowed_rec) + 52.39) * (k / 38))
+
+```
+
+
+```{r Join Season to date and recent stats}
+#in model stats df, .x stats are for team, and .y stats are for opponent
+#stats are season to date unless followed by "rec", which means recent
+model_stats<-small_games_STD%>%
+        left_join(small_game_rolling, by = "URL_ID")
+
+#drop trailing .x and duplicate columns
+model_stats <- model_stats %>% 
+  rename_at(
+    vars(ends_with(".x")),
+    ~str_replace(., "\\..$","")
+  ) %>% 
+  select_at(
+    vars(-ends_with(".y"))
+  )
+
+model_stats<-model_stats[!duplicated(model_stats$ID), ]
+
+```
+
+```{r Create Matchups of teams}
+hm<-model_stats[!duplicated(model_stats$URL_ID), ]
+aw<-model_stats[duplicated(model_stats$URL_ID), ]
+
+model_games<-hm%>%
+        left_join(aw, by= "URL_ID")
+
+model_games <- model_games %>% 
+  rename_at(
+    vars(ends_with(".x")),
+    ~str_replace(., "\\..$","")
+  ) %>% 
+ rename_at(
+    vars(ends_with(".y")),
+    ~str_replace(., "\\..$","_away")
+  )
+
+#Remove Unnecessary Variables for Training Model
+model_games<-subset(model_games, select = -c(Result_away, DrawProability_away, Opp_ID, URL_ID, GameNum))
+
+result_exp<-model_games$Result
+label<-as.integer(model_games$Result)-1
+```
+
+
+```{r Fit XGBoost Model}
+#use all data before 2021 to train model
+model_games_train<-model_games[model_games$Year<2021, ]
+
+model_games_train<-subset(model_games_train, select = -c(Year))
+
+#create dv for training set
+train.label<- model_games_train %>% pull("Result")
+
+#convert win lose draw to integer for xgboost
+#levels must start at 0 so need to subtract 1
+train.label<- as.integer(train.label)-1
+
+# create a data frame with predictor variables 
+x_train = model_games_train %>% select(-c("Result") )
+
+#create test and training sets and dependent variable vectors
+xgb_train<-data.matrix(x_train)
+
+xgb_train_dv<-train.label
+
+
+#create DMatrix objects required for XGBoost
+xgb_train_DMatrix<-xgb.DMatrix(data = xgb_train, label = xgb_train_dv)
+
+
+numberofClasses<-length(unique(model_stats$Result))
+
+params<-list(booster = "gbtree", objective = "multi:softprob",eta=0.1, 
+             gamma=0, max_depth=10, min_child_weight=1, 
+             subsample=1, colsample_bytree=1, 
+             eval_metric = "mlogloss", num_class = numberofClasses)
+
+#perform cross validation to determine the optimal number of trees to train
+cv3<-xgb.cv(params = params, data = xgb_train_DMatrix, nrounds = 200, nfold = 5, showsd = T, stratified = T, print_every_n = 20, early_stopping_rounds = 20, maximize = F, prediction = TRUE)
+
+xgb3<- xgb.train(params = params, data = xgb_train_DMatrix, nrounds = cv3$best_iteration, 
+                           watchlist = list(train=xgb_train_DMatrix), print_every_n = 20, 
+                           early_stopping_rounds = 20, maximize = F)
+
+
+
+```
+
+```{r}
+model_games_val<-model_games[model_games$Year>=2021, ]
+
+model_games_val<-subset(model_games_val, select = -c(Year))
+
+# create a data frame with response or outcome variable 
+
+test.label <- model_games_val %>% pull("Result")
+test.label <- as.integer(test.label)-1
+
+y_test = test.label
+
+# create a data frame with predictor variables 
+x_test = model_games_val %>% select(-c("Result") )
+
+xgb_test_pred<-data.matrix(x_test)
+xgb_test_dv<-y_test
+xgb_test_DMatrix<-xgb.DMatrix(data = as.matrix(xgb_test_pred), label = xgb_test_dv)
+
+#model prediction
+xgbpred_k3 <- predict (xgb3, xgb_test_pred, reshape = T)
+
+xgb.pred = as.data.frame(xgbpred_k3)
+colnames(xgb.pred) = levels(result_exp)
+
+xgb.pred$Pick<-apply(xgb.pred,1,function(x) colnames(xgb.pred[which.max(x)]))
+xgb.pred$label<-levels(result_exp)[test.label+1]
+
+acc = sum(xgb.pred$Pick==xgb.pred$label)/nrow(xgb.pred)
+print(paste("Final Accuracy =",sprintf("%1.2f%%", 100*acc)))
+```
+
+
+```{r}
+xgb_test_DMatrix<-xgb.DMatrix(data = as.matrix(xgb_test_pred), label = xgb_test_dv)
+
+
+xgbpred_k3_Dmatrix<-predict(xgb3, xgb_test_DMatrix)
+
+
+test_prediction <- matrix(xgbpred_k3_Dmatrix, nrow = numberofClasses,
+                          ncol=length(xgbpred_k3_Dmatrix)/numberofClasses) %>%
+  t() %>%
+  data.frame() %>%
+  mutate(label = xgb_test_dv +1,
+         max_prob = max.col(., "last"))
+
+# confusion matrix of test set
+confusionMatrix(factor(test_prediction$max_prob),
+                factor(test_prediction$label),
+                mode = "everything")
+
+#remove DV from names
+names <-  colnames(model_games_val %>% select(-c("Result")))
+# compute feature importance matrix
+importance_matrix = xgb.importance(feature_names = names, model = xgb3)
+importance_matrix
+```
+
+
+ 
